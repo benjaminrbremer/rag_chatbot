@@ -1,3 +1,16 @@
+"""
+rag_gemma.py
+
+Author: Benjamin Bremer (benjaminrbremer@gmail.com)
+
+This file is a simple RAG framework based on Google's Gemma. It 
+will generate embeddings based on provided document chunks,
+perform a similarity search, and generate an answer based on the 
+user's query and the most relevant provided text chunks.
+"""
+
+from typing import List, Literal
+
 from sentence_transformers import SentenceTransformer
 from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 import requests
@@ -19,13 +32,16 @@ def get_embed_model():
         year={2025},
         url={https://arxiv.org/abs/2509.20354}
     }
+
+    Returns:
+        SentenceTransformer object with Gemma embedding model
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     return SentenceTransformer("google/embeddinggemma-300m", device=device), device
 
 
-def get_generation_model(model_size="4b"):
+def get_generation_model(model_size: Literal["270m", "1b", "4b", "12b", "27b"]="4b"):
     """
     Get Google Gemma model for generation. Models are hosted on Hugging Face 
 
@@ -39,6 +55,14 @@ def get_generation_model(model_size="4b"):
         author={Gemma Team},
         year={2025}
     }
+
+    Args:
+        model_size (Literal["270m", "1b", "4b", "12b", "27b"]):
+            The size of the model to load. These are all of the Gemma 3 Iteration 
+            models provided on Hugging Face
+    
+    Returns:
+        The model object, plus a processor object used for prompt templates
     """
     model_id = f"google/gemma-3-{model_size}-it"
 
@@ -51,12 +75,16 @@ def get_generation_model(model_size="4b"):
     return model, processor
 
 
-def generate_embeddings(chunks):
+def generate_embeddings(chunks: List[str]):
     """
     Uses Google's Gemma to generate embeddings for a list of chunks
 
     In the future, I would like to allow users to choose from a variety of models.
     This is good for now - SOTA for its size, pretty good for general local tasks.
+
+    Args:
+        chunks (list[str]):
+            The list of text chunks that may contain relevant context
     """
     model, device = get_embed_model()
 
@@ -65,27 +93,23 @@ def generate_embeddings(chunks):
     return torch.tensor(embeddings, device=device)
 
 
-def run_query(query, chunks):
-    # In the future, embeddings should be persisted and only generated upon 
-    # initial load
-    chunk_embeddings = generate_embeddings(chunks)
-
+def _compute_similarities(embeddings: torch.tensor, query: str):
     # Get an embedding for the query using the same Gemma model
     model, device = get_embed_model()
     query_embeddings = model.encode_query(query)
     query_embeddings = torch.tensor(query_embeddings, device=device)
 
     # Compute similarity between query and chunks and gather most similar chunks
-    similarities = model.similarity(query_embeddings, chunk_embeddings)
+    similarities = model.similarity(query_embeddings, embeddings)
     similarities_flat = similarities.squeeze(0)
     k = min(NUM_RELEVANT_CHUNKS, len(similarities_flat))
     topk_values, topk_indices = torch.topk(similarities_flat, k)
     topk_text = [chunks[i] for i in topk_indices]
 
-    # print(topk_text)
-    # print(topk_values)
-    # print(topk_indices)
+    return topk_text
 
+
+def _augment_query(query: str, topk_text: List[str]):
     # Augment query and generate answer
     aug_query = "Based on the context, answer the users question:\n"
     for i in range(len(topk_text)):
@@ -112,7 +136,36 @@ def run_query(query, chunks):
     inputs = processor.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
     ).to(model.device, dtype=torch.bfloat16)
+
+    return inputs
+
+
+def run_query(query: str, chunks: List[str]):
+    """
+    This function takes a user query, a list of text chunks, and 
+    generates an answer based on the most relevant chunks.
+
+    Args:
+        query (str):
+            The user's question
+        chunks (list[str]):
+            The list of text chunks that may contain relevant context
     
+    Returns:
+        str:
+            The generated response based on the query and context
+    """
+    # In the future, embeddings should be persisted and only generated upon 
+    # initial load
+    chunk_embeddings = generate_embeddings(chunks)
+
+    # Get most relevant text chunks
+    topk_text = _compute_similarities(chunk_embeddings, query)
+
+    # Augment query and convert to model inputs
+    inputs = _augment_query(query, topk_text)
+    
+    # Generate response
     input_len = inputs["input_ids"].shape[-1]
     with torch.inference_mode():
         generation = gen_model.generate(**inputs, max_new_tokens=100, do_sample=False)
