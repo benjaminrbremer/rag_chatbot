@@ -1,13 +1,16 @@
 from sentence_transformers import SentenceTransformer
+from transformers import AutoProcessor, Gemma3ForConditionalGeneration
+import requests
 import torch
 
 
 NUM_RELEVANT_CHUNKS = 5
+GEMMA_MODEL_SIZES = ["270m", "1b", "4b", "12b", "27b"]
 
 
-def get_gemma():
+def get_embed_model():
     """
-    Model is hosted on Hugging Face
+    Get Google Gemma 300M embedding model. Model is hosted on Hugging Face
 
     @article{embedding_gemma_2025,
         title={EmbeddingGemma: Powerful and Lightweight Text Representations},
@@ -19,9 +22,33 @@ def get_gemma():
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(device)
-
     return SentenceTransformer("google/embeddinggemma-300m", device=device), device
+
+
+def get_generation_model(model_size="4b"):
+    """
+    Get Google Gemma model for generation. Models are hosted on Hugging Face 
+
+    Model size can be specified and should be in ["270m", "1b", "4b", "12b", "27b"].
+    For reference, the 4b model maxes out my 3090 with 24gb of VRAM, so it is default.
+
+    @article{gemma_2025,
+        title={Gemma 3},
+        url={https://goo.gle/Gemma3Report},
+        publisher={Kaggle},
+        author={Gemma Team},
+        year={2025}
+    }
+    """
+    model_id = f"google/gemma-3-{model_size}-it"
+
+    model = Gemma3ForConditionalGeneration.from_pretrained(
+        model_id, device_map="auto"
+    ).eval()
+
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    return model, processor
 
 
 def generate_embeddings(chunks):
@@ -31,7 +58,7 @@ def generate_embeddings(chunks):
     In the future, I would like to allow users to choose from a variety of models.
     This is good for now - SOTA for its size, pretty good for general local tasks.
     """
-    model, device = get_gemma()
+    model, device = get_embed_model()
 
     embeddings = model.encode_document(chunks)
 
@@ -44,7 +71,7 @@ def run_query(query, chunks):
     chunk_embeddings = generate_embeddings(chunks)
 
     # Get an embedding for the query using the same Gemma model
-    model, device = get_gemma()
+    model, device = get_embed_model()
     query_embeddings = model.encode_query(query)
     query_embeddings = torch.tensor(query_embeddings, device=device)
 
@@ -55,6 +82,41 @@ def run_query(query, chunks):
     topk_values, topk_indices = torch.topk(similarities_flat, k)
     topk_text = [chunks[i] for i in topk_indices]
 
-    print(topk_text)
-    print(topk_values)
-    print(topk_indices)
+    # print(topk_text)
+    # print(topk_values)
+    # print(topk_indices)
+
+    # Augment query and generate answer
+    aug_query = "Based on the context, answer the users question:\n"
+    for i in range(len(topk_text)):
+        aug_query += f"{i}: {topk_text[i]}\n"
+    aug_query += f"\nUsers Query:\n{query}"
+    messages = [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": "You are a research assistant that will be given a question from a user and a list of relevant chunks of text from US patent documents. Please use the provided context to answer research questions from the user."
+            }]
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": aug_query,
+            }]
+        }
+    ]
+
+    gen_model, processor = get_generation_model()
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+    ).to(model.device, dtype=torch.bfloat16)
+    
+    input_len = inputs["input_ids"].shape[-1]
+    with torch.inference_mode():
+        generation = gen_model.generate(**inputs, max_new_tokens=100, do_sample=False)
+        generation = generation[0][input_len:]
+    decoded = processor.decode(generation, skip_special_tokens=True)
+    
+    return decoded
